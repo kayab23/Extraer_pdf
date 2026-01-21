@@ -1,0 +1,28 @@
+# .gitignore recomendado
+
+# Entorno virtual
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos temporales
+*.tmp
+*.log
+*.bak
+*.swp
+
+# Salidas y resultados
+salida/*.json
+salida/*.csv
+salida/*.xlsx
+salida/*.txt
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Otros
+*.pdf
+!PEDIMENTOS 2025/
