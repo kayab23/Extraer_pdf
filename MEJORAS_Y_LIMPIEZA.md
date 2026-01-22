@@ -28,6 +28,23 @@
   - `README.md` (instrucciones y resumen)
   - `.gitignore` (excluir archivos temporales, .venv, __pycache__)
 
+## Cambios recientes (22-01-2026)
+
+- Añadida lógica para evitar que bloques metadata (SERIES, GUIA/ORDEN EMBARQUE, RFC, e.firma, NUMERO DE SERIE, IDENTIF/COMPLEMENTO) sean capturados como `DESCRIPCION`.
+- Implementada función de recuperación `recover_description_from_pdf` que busca la primera línea válida posterior a la FRACCION y que ahora descarta líneas base64-like y listas de `SERIES:`.
+- Mejoras en `scripts/inspect_user_cases.py` para localizar variantes de nombres de archivo y facilitar inspecciones dirigidas.
+- Regenerado `salida/pedimentos_completo.csv` con las heurísticas actualizadas.
+
+## Sugerencia de limpieza segura
+
+- No elimines PDFs originales; considerarlos fuente de verdad.
+- Revisar y eliminar solo archivos generados temporalmente grandes o duplicados:
+   - Archivos en `salida/` antiguos o previos (hacer backup si duda).
+   - Archivos `*.err`, `*.272`, `*.195` en `PEDIMENTOS 2025/ARCHIVOS_NO_PEDIMENTOS/` si son residuos procesados.
+   - Copias de PDFs con sufijos `(1)` o `proforma` que ya hayan sido procesadas.
+
+Antes de borrar, puedo generar un listado de candidatos con tamaños y rutas para que decidas.
+
 ## Recomendaciones para el Repositorio
 
 - Agregar README.md con instrucciones de uso, dependencias y ejemplos.
