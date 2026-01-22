@@ -26,3 +26,13 @@ Thumbs.db
 # Otros
 *.pdf
 !PEDIMENTOS 2025/
+!PEDIMENTOS 2025/**
+
+# Default outputs and caches
+venv/
+.pytest_cache/
+.vscode/
+__pycache__/
+*.pyc
+salida/
+.env
