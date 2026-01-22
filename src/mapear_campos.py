@@ -522,6 +522,9 @@ def extraer_partidas_por_posicion(pdf_path):
                     tasa_tokens = cols_line.get('TASA', [])
                     sec = ' '.join([t for _, t in sorted(sec_tokens, key=lambda x: x[0])]).strip()
                     fr = ' '.join([t for _, t in sorted(fr_tokens, key=lambda x: x[0])]).strip()
+                    # Validar que FRACCION tenga el formato esperado (8 dígitos). Si no, ignorar
+                    if not re.match(r"^\d{8}$", fr):
+                        fr = ''
                     desc = ' '.join([t for _, t in sorted(desc_tokens, key=lambda x: x[0])]).strip()
                     tasa = ' '.join([t for _, t in sorted(tasa_tokens, key=lambda x: x[0])]).strip()
 
@@ -544,6 +547,25 @@ def extraer_partidas_por_posicion(pdf_path):
                         # iniciar nueva partida
                         current = {'SEC': sec or '', 'FRACCION': fr or '', 'DESCRIPCION': '' if desc == 'NaN' else desc or '', 'TASA_IGI': tasa or ''}
 
+                        # Si la descripcion inicial parece ser metadata (IDENTIF/COMPLEMENTO/SERIES/etc.),
+                        # buscar una linea valida posterior y reemplazarla.
+                        init_desc = current.get('DESCRIPCION','')
+                        if init_desc:
+                            alpha_words_init = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", init_desc)
+                            if len(alpha_words_init) < 3 or re.search(r"\b(IDENTIF|COMPLEMENTO|SERIES:|SERIE|GUIA|ORDEN\s+EMBARQUE|RFC:|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", init_desc, re.IGNORECASE):
+                                for j in range(i+1, min(L, i+8)):
+                                    topj, colsj = collected[j]
+                                    full_line_j = ' '.join([t for colvals in colsj.values() for _, t in sorted(colvals, key=lambda x: x[0])]).strip()
+                                    cand = re.sub(r'^[\d\W_,.:;-]+', '', full_line_j).strip()
+                                    if not cand:
+                                        continue
+                                    # require at least 3 alpha tokens and not metadata markers
+                                    alpha_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", cand)
+                                    if len(alpha_words) >= 3 and not re.search(r"\b(IDENTIF|COMPLEMENTO|SERIES:|SERIE|GUIA|ORDEN\s+EMBARQUE|RFC:|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", cand, re.IGNORECASE):
+                                        current['DESCRIPCION'] = cand
+                                        i = j
+                                        break
+
                         # Lookahead: si la siguiente fila no tiene FRACCION/SEC pero contiene DESCRIPCION
                         # se asume que esa línea es la descripción válida (ej. "MEDIAS DE COMPRESION PARA MECANOTERAPIA")
                         if i + 1 < L:
@@ -561,13 +583,14 @@ def extraer_partidas_por_posicion(pdf_path):
                                     return False
                                 num_tokens = len(words)
                                 num_alpha = sum(1 for w in words if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", w))
-                                if num_alpha == 0:
+                                # require at least 3 alphabetic tokens to be a description (avoid short metadata)
+                                if num_alpha < 3:
                                     return False
                                 # reject short tokens that look like codes
                                 if num_tokens <= 2 and re.match(r"^[0-9,\.\-]+$", s_clean):
                                     return False
-                                # reject metadata blocks
-                                if re.search(r"\b(MARCA|MODELO|IDENTIF|COMPLEMENTO|OBSERVACIONES|No\.|FACTURA|PARTIDA|CLAVE|NUMERO|LOTE|CLAVE NUM)\b", s_clean, re.IGNORECASE):
+                                # reject metadata blocks and common non-description markers
+                                if re.search(r"\b(MARCA|MODELO|IDENTIF|IDENTIFICADOR|COMPLEMENTO|OBSERVACIONES|SERIES|SERIE|No\.|FACTURA|PARTIDA|CLAVE|NUMERO|LOTE|CLAVE NUM|GUIA|ORDEN\s+EMBARQUE|RFC|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", s_clean, re.IGNORECASE):
                                     return False
                                 return True
 
@@ -611,7 +634,15 @@ def extraer_partidas_por_posicion(pdf_path):
                                             break
                             # Opción A (más agresiva): si no se encontró descripción en las primeras 3 filas,
                             # buscar la primera línea posterior con top > top(fracción)+small_offset
-                            if (not used_next) and (not current.get('DESCRIPCION') or not str(current.get('DESCRIPCION')).strip()):
+                            # If we didn't use lookahead and the current description is empty or invalid,
+                            # perform an aggressive search over all subsequent rows to find a valid description.
+                            desc_now = current.get('DESCRIPCION') or ''
+                            desc_invalid = False
+                            if desc_now:
+                                alpha_now = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", desc_now)
+                                if len(alpha_now) < 3 or re.search(r"\b(IDENTIF|COMPLEMENTO|SERIES:|SERIE|GUIA|ORDEN\s+EMBARQUE|RFC:|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", desc_now, re.IGNORECASE):
+                                    desc_invalid = True
+                            if (not used_next) and (not desc_now.strip() or desc_invalid):
                                 # buscar en cualquier fila posterior; eliminar códigos numéricos al inicio
                                 def strip_leading_codes(s):
                                     if not s:
@@ -712,7 +743,26 @@ def extraer_datos_completos(texto):
         re.DOTALL
     )
     resultados = []
+    def is_valid_desc_text(s):
+        if not s:
+            return False
+        s_clean = s.strip()
+        # reject obvious metadata lines
+        if re.search(r"\b(GUIA|ORDEN\s+EMBARQUE|RFC:|E\.FIRMA|NUMERO DE SERIE|SERIES:|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", s_clean, re.IGNORECASE):
+            return False
+        words = re.findall(r"\w+", s_clean)
+        if not words:
+            return False
+        num_alpha = sum(1 for w in words if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", w))
+        if num_alpha < 3:
+            return False
+        return True
+
     for match in patron_partidas.finditer(texto):
+        desc_candidate = match.group(3).strip()
+        if not is_valid_desc_text(desc_candidate):
+            # skip noisy matches that are likely headers/metadata
+            continue
         resultados.append({
             "NUM_PEDIMENTO": pedimento,
             "TIPO_CAMBIO": tipo_cambio,
@@ -721,7 +771,7 @@ def extraer_datos_completos(texto):
             "NOMBRE_DENOMINACION_O_RAZON_SOCIAL": nombre,
             "SEC": match.group(1),
             "FRACCION": match.group(2),
-            "DESCRIPCION": match.group(3).strip(),
+            "DESCRIPCION": desc_candidate,
             "TASA_IGI": match.group(4)
         })
     return pd.DataFrame(resultados)
@@ -762,13 +812,38 @@ def recover_description_from_pdf(pdf_path, sec, fraccion):
                             if re.search(r"^\s*(IVA|IGI)\b", cand_line, re.IGNORECASE):
                                 j += 1
                                 continue
-                            if re.search(r"\b(CLAVE|NUM\.|MARCA|MODELO|CODIGO|PRODUCTO|CLAVE NUM|OBSERVACIONES|IDENTIF|COMPLEMENTO)\b", cand_line, re.IGNORECASE):
+                            # skip common non-description markers
+                            if re.search(r"\b(CLAVE|NUM\.|MARCA|MODELO|CODIGO|PRODUCTO|CLAVE NUM|OBSERVACIONES|IDENTIF|IDENTIFICADOR|COMPLEMENTO|SERIES|SERIE|GUIA|ORDEN\s+EMBARQUE|RFC|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", cand_line, re.IGNORECASE):
                                 j += 1
                                 continue
                             # strip leading numeric/code tokens
                             cand_clean = re.sub(r'^[\d\W_,.:;-]+', '', cand_line).strip()
-                            # require at least one alphabetic token
-                            if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", cand_clean):
+                            # quick filters: skip long base64-like lines, or lines that are mostly punctuation/numeric
+                            if re.search(r"[A-Za-z0-9+/=]{40,}", cand_clean):
+                                j += 1
+                                continue
+                            tokens = re.findall(r"\S+", cand_clean)
+                            if not tokens:
+                                j += 1
+                                continue
+                            alpha_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", cand_clean)
+                            num_tokens = len(tokens)
+                            num_alpha = len(alpha_words)
+                            # ratio of alphabetic tokens
+                            alpha_ratio = num_alpha / num_tokens if num_tokens > 0 else 0
+                            # detect 'series' style lines: many comma-separated tokens that are mostly alnum/hyphen
+                            comma_tokens = [t for t in re.split(r",\s*", cand_clean) if t]
+                            series_like = 0
+                            for t in comma_tokens:
+                                letters = sum(1 for c in t if c.isalpha())
+                                digits = sum(1 for c in t if c.isdigit())
+                                if digits > 0 and letters <= 3 and '-' in t or (len(t) >= 6 and (digits > 0 and letters > 0 and '-' in t)):
+                                    series_like += 1
+                            if len(comma_tokens) >= 3 and series_like >= max(1, len(comma_tokens)//3):
+                                j += 1
+                                continue
+                            # require at least 3 alpha-words and a reasonable alphabetic ratio to be a description
+                            if num_alpha >= 3 and alpha_ratio >= 0.35:
                                 return cand_clean
                             j += 1
     except Exception:
@@ -957,8 +1032,10 @@ def procesar_pedimentos_y_generar_csv(carpeta, archivo_salida_csv):
             # Intentar recuperar DESCRIPCION vacías buscando en el PDF la FRACCION y tomando
             # la primera línea útil posterior a IVA/IGI
             try:
+                is_meta = df_final['DESCRIPCION'].astype(str).str.contains(r"\b(IDENTIF|COMPLEMENTO|SERIES:|GUIA|ORDEN\s+EMBARQUE|RFC:|E\.FIRMA|NUMERO DE SERIE|NO ES LA DESCRIPCION|ESTO NO ES LA DESCRIPCION)\b", case=False, na=False)
                 empty_mask = df_final['DESCRIPCION'].isnull() | (df_final['DESCRIPCION'].astype(str).str.strip() == '')
-                for idx in df_final[empty_mask].index:
+                recover_mask = empty_mask | is_meta
+                for idx in df_final[recover_mask].index:
                     try:
                         archivo = df_final.at[idx, 'Archivo'] if 'Archivo' in df_final.columns else ''
                         pdf_path = os.path.join(carpeta, archivo) if archivo else None
