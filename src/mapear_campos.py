@@ -512,7 +512,10 @@ def extraer_partidas_por_posicion(pdf_path):
 
                 # Ahora agrupar por filas completas usando detección de nueva SEC (col SEC no vacía)
                 current = None
-                for top, cols_line in collected:
+                i = 0
+                L = len(collected)
+                while i < L:
+                    top, cols_line = collected[i]
                     sec_tokens = cols_line.get('SEC', [])
                     fr_tokens = cols_line.get('FRACCION', [])
                     desc_tokens = cols_line.get('DESCRIPCION', [])
@@ -521,6 +524,7 @@ def extraer_partidas_por_posicion(pdf_path):
                     fr = ' '.join([t for _, t in sorted(fr_tokens, key=lambda x: x[0])]).strip()
                     desc = ' '.join([t for _, t in sorted(desc_tokens, key=lambda x: x[0])]).strip()
                     tasa = ' '.join([t for _, t in sorted(tasa_tokens, key=lambda x: x[0])]).strip()
+
                     # detectar inicio de nueva partida: SEC con dígitos o FRACCION presente
                     if sec or fr:
                         # finalizar current
@@ -534,11 +538,121 @@ def extraer_partidas_por_posicion(pdf_path):
                                     current['TASA_IGI'] = m_igi.group(1)
                                     current['DESCRIPCION'] = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", d, flags=re.IGNORECASE).strip(' ,;')
                                 elif m_iva:
-                                    # eliminar IVA del texto; preferir IGI si aparece en otra línea
                                     current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", d, flags=re.IGNORECASE).strip(' ,;')
                             partidas.append(current)
-                        current = {'SEC': sec or '', 'FRACCION': fr or '', 'DESCRIPCION': desc or '', 'TASA_IGI': tasa or ''}
-                        # si en la misma línea la descripcion trae IGI/IVA, extraerlo ahora
+
+                        # iniciar nueva partida
+                        current = {'SEC': sec or '', 'FRACCION': fr or '', 'DESCRIPCION': '' if desc == 'NaN' else desc or '', 'TASA_IGI': tasa or ''}
+
+                        # Lookahead: si la siguiente fila no tiene FRACCION/SEC pero contiene DESCRIPCION
+                        # se asume que esa línea es la descripción válida (ej. "MEDIAS DE COMPRESION PARA MECANOTERAPIA")
+                        if i + 1 < L:
+                            # Lookahead: inspect next up to 3 rows to find a valid description line
+                            def is_valid_desc_line(s):
+                                if not s:
+                                    return False
+                                s_clean = s.strip()
+                                # reject obvious tax or header lines
+                                if re.search(r"^\s*(IVA|IGI)\b", s_clean, re.IGNORECASE):
+                                    return False
+                                # reject lines that are mostly numeric or column headers
+                                words = re.findall(r"\w+", s_clean)
+                                if not words:
+                                    return False
+                                num_tokens = len(words)
+                                num_alpha = sum(1 for w in words if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", w))
+                                if num_alpha == 0:
+                                    return False
+                                # reject short tokens that look like codes
+                                if num_tokens <= 2 and re.match(r"^[0-9,\.\-]+$", s_clean):
+                                    return False
+                                # reject metadata blocks
+                                if re.search(r"\b(MARCA|MODELO|IDENTIF|COMPLEMENTO|OBSERVACIONES|No\.|FACTURA|PARTIDA|CLAVE|NUMERO|LOTE|CLAVE NUM)\b", s_clean, re.IGNORECASE):
+                                    return False
+                                return True
+
+                            used_next = False
+                            for look in range(1, 4):
+                                if i + look < L:
+                                    _, look_cols = collected[i+look]
+                                    # build a full-line text from all columns (some PDFs place description outside DESCRIPCION column)
+                                    next_fr = ' '.join([t for _, t in sorted(look_cols.get('FRACCION', []), key=lambda x: x[0])]).strip()
+                                    next_sec = ' '.join([t for _, t in sorted(look_cols.get('SEC', []), key=lambda x: x[0])]).strip()
+                                    # combine all tokens in the line across columns
+                                    next_full = ' '.join([t for colvals in look_cols.values() for _, t in sorted(colvals, key=lambda x: x[0])]).strip()
+                                    # also compute what would be in the DESCRIPCION column specifically
+                                    next_desc = ' '.join([t for _, t in sorted(look_cols.get('DESCRIPCION', []), key=lambda x: x[0])]).strip()
+                                    # prefer the full-line text for validation, but keep column text for assignment when possible
+                                    candidate_text = next_full if next_full else next_desc
+                                    if (not next_fr and not next_sec) and is_valid_desc_line(candidate_text):
+                                        # assign the more focused column value if available, otherwise the whole line
+                                        current['DESCRIPCION'] = (next_desc or candidate_text).strip()
+                                        # advance i to consume the rows we used (consume look rows)
+                                        i += look
+                                        used_next = True
+                                        break
+                            # Regla específica: si la fila inmediata siguiente es IVA/IGI, saltarla
+                            if (not used_next) and (i + 1 < L):
+                                _, immediate_cols = collected[i+1]
+                                immediate_full = ' '.join([t for colvals in immediate_cols.values() for _, t in sorted(colvals, key=lambda x: x[0])]).strip()
+                                if re.search(r"^\s*(IVA|IGI)\b", immediate_full, re.IGNORECASE):
+                                    # buscar la primera línea no-IVA/IGI válida después de la inmediata
+                                    for j in range(i+2, min(L, i+8)):
+                                        _, colsj = collected[j]
+                                        full_line_j = ' '.join([t for colvals in colsj.values() for _, t in sorted(colvals, key=lambda x: x[0])]).strip()
+                                        # quitar códigos iniciales breves (números/puntuación)
+                                        cand = re.sub(r'^[\d\W_,.:;-]+', '', full_line_j).strip()
+                                        if not cand:
+                                            continue
+                                        if is_valid_desc_line(cand):
+                                            current['DESCRIPCION'] = cand
+                                            i = j
+                                            used_next = True
+                                            break
+                            # Opción A (más agresiva): si no se encontró descripción en las primeras 3 filas,
+                            # buscar la primera línea posterior con top > top(fracción)+small_offset
+                            if (not used_next) and (not current.get('DESCRIPCION') or not str(current.get('DESCRIPCION')).strip()):
+                                # buscar en cualquier fila posterior; eliminar códigos numéricos al inicio
+                                def strip_leading_codes(s):
+                                    if not s:
+                                        return s
+                                    parts = s.split()
+                                    i_part = 0
+                                    for p in parts:
+                                        # considerar código si es mayoritariamente dígitos/puntuación o token corto
+                                        letters = sum(1 for c in p if c.isalpha())
+                                        digits = sum(1 for c in p if c.isdigit())
+                                        if letters == 0 and digits > 0:
+                                            i_part += 1
+                                            continue
+                                        if len(p) <= 3 and digits > 0:
+                                            i_part += 1
+                                            continue
+                                        break
+                                    return ' '.join(parts[i_part:]).strip()
+
+                                for j in range(i+1, L):
+                                    topj, colsj = collected[j]
+                                    full_line = ' '.join([t for colvals in colsj.values() for _, t in sorted(colvals, key=lambda x: x[0])]).strip()
+                                    candidate = strip_leading_codes(full_line)
+                                    if not candidate:
+                                        continue
+                                    if is_valid_desc_line(candidate):
+                                        current['DESCRIPCION'] = candidate
+                                        i = j
+                                        break
+                            _, next_cols = collected[i+1]
+                            next_fr = ' '.join([t for _, t in sorted(next_cols.get('FRACCION', []), key=lambda x: x[0])]).strip()
+                            next_sec = ' '.join([t for _, t in sorted(next_cols.get('SEC', []), key=lambda x: x[0])]).strip()
+                            next_desc = ' '.join([t for _, t in sorted(next_cols.get('DESCRIPCION', []), key=lambda x: x[0])]).strip()
+                            # If next line has no fraction/sec but has a non-trivial description, use it
+                            if (not next_fr and not next_sec) and next_desc:
+                                # filter out metadata rows that contain words like MARCA/MODELO/IDENTIFICACION/COMPLEMENTO
+                                if not re.search(r"\b(MARCA|MODELO|IDENT|COMPLEMENTO|OBSERVACIONES|No\.|FACTURA|PARTIDA)\b", next_desc, re.IGNORECASE):
+                                    current['DESCRIPCION'] = next_desc.strip()
+                                    # consume the next row as it was used for description
+                                    i += 1
+                        # also extract IGI/IVA if present in same line
                         if current.get('DESCRIPCION'):
                             d0 = current['DESCRIPCION']
                             m_igi0 = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", d0, re.IGNORECASE)
@@ -547,14 +661,17 @@ def extraer_partidas_por_posicion(pdf_path):
                                 current['TASA_IGI'] = m_igi0.group(1)
                                 current['DESCRIPCION'] = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", d0, flags=re.IGNORECASE).strip(' ,;')
                             elif m_iva0 and not current.get('TASA_IGI'):
-                                # eliminar IVA si no hay IGI
                                 current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", d0, flags=re.IGNORECASE).strip(' ,;')
                     else:
                         # continuación de descripcion
                         if current:
                             if desc:
-                                current['DESCRIPCION'] = (current.get('DESCRIPCION', '') + ' ' + desc).strip()
-                                # al concatenar, buscar IGI/IVA y extraer
+                                # append and filter metadata fragments
+                                combined = (current.get('DESCRIPCION', '') + ' ' + desc).strip()
+                                # remove lines that look like MARCA/MODELO blocks
+                                combined = re.sub(r"\b(MARCA|MODELO|IDENTIFICACION|COMPLEMENTO)\b[:\s0-9A-Z\-]*", "", combined, flags=re.IGNORECASE).strip()
+                                current['DESCRIPCION'] = combined
+                                # buscar IGI/IVA en la descripcion recién concatenada
                                 dtmp = current['DESCRIPCION']
                                 m_igi_c = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", dtmp, re.IGNORECASE)
                                 m_iva_c = re.search(r"\bIVA\s*([0-9]+\.[0-9]{5})\b", dtmp, re.IGNORECASE)
@@ -564,8 +681,8 @@ def extraer_partidas_por_posicion(pdf_path):
                                 elif m_iva_c and not current.get('TASA_IGI'):
                                     current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", dtmp, flags=re.IGNORECASE).strip(' ,;')
                             if tasa and not current.get('TASA_IGI'):
-                                # si hay un token en la columna tasa, preferirlo solo si no existe IGI en descripcion
                                 current['TASA_IGI'] = tasa
+                    i += 1
                 if current:
                     partidas.append(current)
     except Exception:
@@ -608,6 +725,55 @@ def extraer_datos_completos(texto):
             "TASA_IGI": match.group(4)
         })
     return pd.DataFrame(resultados)
+
+
+def recover_description_from_pdf(pdf_path, sec, fraccion):
+    """Abrir PDF y localizar la línea de partida (SEC y FRACCION) y devolver
+    la primera línea válida posterior a IVA/IGI como descripción.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words:
+                    continue
+                # agrupar por top
+                lines = {}
+                for w in words:
+                    top = round(w.get('top', 0))
+                    lines.setdefault(top, []).append(w)
+                tops = sorted(lines.keys())
+                for idx, top in enumerate(tops):
+                    line_txt = ' '.join([ww['text'] for ww in sorted(lines[top], key=lambda x: x['x0'])])
+                    # buscar coincidencia de fraccion (y sec si disponible)
+                    if fraccion and fraccion in line_txt:
+                        # confirmar SEC si se pasó
+                        if sec and str(sec).strip() and str(sec) not in line_txt:
+                            # puede haber varios matches; no exigir SEC
+                            pass
+                        # buscar la siguiente línea válida (saltar IVA/IGI y cabeceras)
+                        j = idx + 1
+                        while j < len(tops):
+                            cand_line = ' '.join([ww['text'] for ww in sorted(lines[tops[j]], key=lambda x: x['x0'])]).strip()
+                            # saltar líneas vacías o de IVA/IGI o encabezados técnicos
+                            if not cand_line:
+                                j += 1
+                                continue
+                            if re.search(r"^\s*(IVA|IGI)\b", cand_line, re.IGNORECASE):
+                                j += 1
+                                continue
+                            if re.search(r"\b(CLAVE|NUM\.|MARCA|MODELO|CODIGO|PRODUCTO|CLAVE NUM|OBSERVACIONES|IDENTIF|COMPLEMENTO)\b", cand_line, re.IGNORECASE):
+                                j += 1
+                                continue
+                            # strip leading numeric/code tokens
+                            cand_clean = re.sub(r'^[\d\W_,.:;-]+', '', cand_line).strip()
+                            # require at least one alphabetic token
+                            if re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", cand_clean):
+                                return cand_clean
+                            j += 1
+    except Exception:
+        return None
+    return None
 
 def procesar_pedimentos_y_generar_csv(carpeta, archivo_salida_csv):
     resultados = []
@@ -786,6 +952,24 @@ def procesar_pedimentos_y_generar_csv(carpeta, archivo_salida_csv):
                     # si aun no hay tasa y la columna tasa tiene valor, mantenerla
                     if (not df_final.at[idx, 'TASA_IGI'] or str(df_final.at[idx, 'TASA_IGI']).strip() == '') and tasa:
                         df_final.at[idx, 'TASA_IGI'] = tasa
+            except Exception:
+                pass
+            # Intentar recuperar DESCRIPCION vacías buscando en el PDF la FRACCION y tomando
+            # la primera línea útil posterior a IVA/IGI
+            try:
+                empty_mask = df_final['DESCRIPCION'].isnull() | (df_final['DESCRIPCION'].astype(str).str.strip() == '')
+                for idx in df_final[empty_mask].index:
+                    try:
+                        archivo = df_final.at[idx, 'Archivo'] if 'Archivo' in df_final.columns else ''
+                        pdf_path = os.path.join(carpeta, archivo) if archivo else None
+                        if pdf_path and os.path.exists(pdf_path):
+                            sec = str(df_final.at[idx, 'SEC']) if 'SEC' in df_final.columns else ''
+                            fr = str(df_final.at[idx, 'FRACCION']) if 'FRACCION' in df_final.columns else ''
+                            desc_rec = recover_description_from_pdf(pdf_path, sec, fr)
+                            if desc_rec:
+                                df_final.at[idx, 'DESCRIPCION'] = desc_rec
+                    except Exception:
+                        continue
             except Exception:
                 pass
         df_final.to_csv(archivo_salida_csv, index=False, encoding="utf-8")
