@@ -445,6 +445,134 @@ def extraer_cabecera_pedimento(texto):
     return pedimento, tipo_cambio, aduana
 
 
+def extraer_partidas_por_posicion(pdf_path):
+    """Extrae las partidas (SEC, FRACCION, DESCRIPCION, TASA_IGI) usando coordenadas.
+    Devuelve lista de dicts: {'SEC','FRACCION','DESCRIPCION','TASA_IGI'}.
+    """
+    partidas = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words:
+                    continue
+                # Agrupar por top para formar líneas
+                lines = {}
+                for w in words:
+                    top = round(w.get('top', 0))
+                    lines.setdefault(top, []).append(w)
+                # Buscar línea de cabecera de partidas
+                header_top = None
+                header_cols = {}
+                for top, wlist in sorted(lines.items()):
+                    txt = ' '.join([ww['text'] for ww in sorted(wlist, key=lambda x: x['x0'])]).upper()
+                    if 'SEC' in txt and 'FRACCION' in txt and 'DESCRIPCION' in txt:
+                        header_top = top
+                        # mapear posiciones por palabra
+                        for ww in sorted(wlist, key=lambda x: x['x0']):
+                            t = ww['text'].upper()
+                            if 'SEC' in t:
+                                header_cols['SEC'] = ww['x0']
+                            if 'FRACCION' in t or 'FRACCIÓN' in t:
+                                header_cols['FRACCION'] = ww['x0']
+                            if 'DESCRIPCION' in t or 'DESCRIPCIÓN' in t:
+                                header_cols['DESCRIPCION'] = ww['x0']
+                            if 'TASA' in t or 'IGI' in t or 'TASA_IGI' in t:
+                                header_cols['TASA'] = ww['x0']
+                        break
+                if header_top is None:
+                    continue
+                # Determinar límites de columnas por orden de x
+                ordered = sorted(header_cols.items(), key=lambda x: x[1])
+                limits = {}
+                for i, (k, x0) in enumerate(ordered):
+                    start = x0
+                    end = ordered[i+1][1] if i+1 < len(ordered) else float('inf')
+                    limits[k] = (start, end)
+
+                # Recolectar palabras por columna para líneas debajo de header
+                collected = []
+                stop_patterns = re.compile(r'FIN DE PEDIMENTO|\*{4,}|OBSERVACIONES A NIVEL PARTIDA', re.IGNORECASE)
+                for top, wlist in sorted(lines.items()):
+                    if top <= header_top:
+                        continue
+                    # si línea indica fin, romper
+                    line_txt = ' '.join([ww['text'] for ww in sorted(wlist, key=lambda x: x['x0'])])
+                    if stop_patterns.search(line_txt):
+                        break
+                    # clasificar palabras por columna
+                    cols_line = {k: [] for k in limits}
+                    for ww in sorted(wlist, key=lambda x: x['x0']):
+                        x0 = ww.get('x0', 0)
+                        for k, (s, e) in limits.items():
+                            if x0 >= s - 1 and x0 < e - 1:
+                                cols_line[k].append((x0, ww['text']))
+                                break
+                    collected.append((top, cols_line))
+
+                # Ahora agrupar por filas completas usando detección de nueva SEC (col SEC no vacía)
+                current = None
+                for top, cols_line in collected:
+                    sec_tokens = cols_line.get('SEC', [])
+                    fr_tokens = cols_line.get('FRACCION', [])
+                    desc_tokens = cols_line.get('DESCRIPCION', [])
+                    tasa_tokens = cols_line.get('TASA', [])
+                    sec = ' '.join([t for _, t in sorted(sec_tokens, key=lambda x: x[0])]).strip()
+                    fr = ' '.join([t for _, t in sorted(fr_tokens, key=lambda x: x[0])]).strip()
+                    desc = ' '.join([t for _, t in sorted(desc_tokens, key=lambda x: x[0])]).strip()
+                    tasa = ' '.join([t for _, t in sorted(tasa_tokens, key=lambda x: x[0])]).strip()
+                    # detectar inicio de nueva partida: SEC con dígitos o FRACCION presente
+                    if sec or fr:
+                        # finalizar current
+                        if current:
+                            # limpiar impuesto incrustado en descripcion antes de anexar
+                            if current.get('DESCRIPCION'):
+                                d = current['DESCRIPCION']
+                                m_igi = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", d, re.IGNORECASE)
+                                m_iva = re.search(r"\bIVA\s*([0-9]+\.[0-9]{5})\b", d, re.IGNORECASE)
+                                if m_igi:
+                                    current['TASA_IGI'] = m_igi.group(1)
+                                    current['DESCRIPCION'] = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", d, flags=re.IGNORECASE).strip(' ,;')
+                                elif m_iva:
+                                    # eliminar IVA del texto; preferir IGI si aparece en otra línea
+                                    current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", d, flags=re.IGNORECASE).strip(' ,;')
+                            partidas.append(current)
+                        current = {'SEC': sec or '', 'FRACCION': fr or '', 'DESCRIPCION': desc or '', 'TASA_IGI': tasa or ''}
+                        # si en la misma línea la descripcion trae IGI/IVA, extraerlo ahora
+                        if current.get('DESCRIPCION'):
+                            d0 = current['DESCRIPCION']
+                            m_igi0 = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", d0, re.IGNORECASE)
+                            m_iva0 = re.search(r"\bIVA\s*([0-9]+\.[0-9]{5})\b", d0, re.IGNORECASE)
+                            if m_igi0:
+                                current['TASA_IGI'] = m_igi0.group(1)
+                                current['DESCRIPCION'] = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", d0, flags=re.IGNORECASE).strip(' ,;')
+                            elif m_iva0 and not current.get('TASA_IGI'):
+                                # eliminar IVA si no hay IGI
+                                current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", d0, flags=re.IGNORECASE).strip(' ,;')
+                    else:
+                        # continuación de descripcion
+                        if current:
+                            if desc:
+                                current['DESCRIPCION'] = (current.get('DESCRIPCION', '') + ' ' + desc).strip()
+                                # al concatenar, buscar IGI/IVA y extraer
+                                dtmp = current['DESCRIPCION']
+                                m_igi_c = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", dtmp, re.IGNORECASE)
+                                m_iva_c = re.search(r"\bIVA\s*([0-9]+\.[0-9]{5})\b", dtmp, re.IGNORECASE)
+                                if m_igi_c:
+                                    current['TASA_IGI'] = m_igi_c.group(1)
+                                    current['DESCRIPCION'] = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", dtmp, flags=re.IGNORECASE).strip(' ,;')
+                                elif m_iva_c and not current.get('TASA_IGI'):
+                                    current['DESCRIPCION'] = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", dtmp, flags=re.IGNORECASE).strip(' ,;')
+                            if tasa and not current.get('TASA_IGI'):
+                                # si hay un token en la columna tasa, preferirlo solo si no existe IGI en descripcion
+                                current['TASA_IGI'] = tasa
+                if current:
+                    partidas.append(current)
+    except Exception:
+        pass
+    return partidas
+
+
 def extraer_datos_completos(texto):
     # --- 1. Extracción de Cabecera robusta ---
     # Validar que el texto contiene las tres secciones clave
@@ -492,14 +620,55 @@ def procesar_pedimentos_y_generar_csv(carpeta, archivo_salida_csv):
         id_fiscal_pos, nombre_pos = extraer_datos_proveedor_por_posicion(pdf_path)
         if id_fiscal_pos or nombre_pos:
             # inyectar estos valores en la extracción completa
-            df = extraer_datos_completos(texto)
-            if not df.empty:
-                df["ID_FISCAL"] = df["ID_FISCAL"].fillna("")
-                df["NOMBRE_DENOMINACION_O_RAZON_SOCIAL"] = df["NOMBRE_DENOMINACION_O_RAZON_SOCIAL"].fillna("")
-                df.loc[:, "ID_FISCAL"] = id_fiscal_pos
-                df.loc[:, "NOMBRE_DENOMINACION_O_RAZON_SOCIAL"] = nombre_pos
+            # si hay partidas por posición, usarlas para armar filas con ID/NOMBRE
+            partidas = extraer_partidas_por_posicion(pdf_path)
+            if partidas:
+                pedimento, tipo_cambio, aduana = extraer_cabecera_pedimento(texto)
+                resultados_local = []
+                for p in partidas:
+                    fila = {
+                        "NUM_PEDIMENTO": pedimento,
+                        "TIPO_CAMBIO": tipo_cambio,
+                        "ADUANA": aduana,
+                        "ID_FISCAL": id_fiscal_pos,
+                        "NOMBRE_DENOMINACION_O_RAZON_SOCIAL": nombre_pos,
+                        "SEC": p.get('SEC',''),
+                        "FRACCION": p.get('FRACCION',''),
+                        "DESCRIPCION": p.get('DESCRIPCION',''),
+                        "TASA_IGI": p.get('TASA_IGI','')
+                    }
+                    resultados_local.append(fila)
+                # convertir a df para mantener compatibilidad
+                df = pd.DataFrame(resultados_local)
+            else:
+                df = extraer_datos_completos(texto)
+                if not df.empty:
+                    df["ID_FISCAL"] = df["ID_FISCAL"].fillna("")
+                    df["NOMBRE_DENOMINACION_O_RAZON_SOCIAL"] = df["NOMBRE_DENOMINACION_O_RAZON_SOCIAL"].fillna("")
+                    df.loc[:, "ID_FISCAL"] = id_fiscal_pos
+                    df.loc[:, "NOMBRE_DENOMINACION_O_RAZON_SOCIAL"] = nombre_pos
         else:
-            df = extraer_datos_completos(texto)
+            # intentar extraer partidas por posición aun cuando no se obtuvo ID/NOMBRE por posición
+            partidas = extraer_partidas_por_posicion(pdf_path)
+            if partidas:
+                pedimento, tipo_cambio, aduana = extraer_cabecera_pedimento(texto)
+                resultados_local = []
+                for p in partidas:
+                    fila = {
+                        "NUM_PEDIMENTO": pedimento,
+                        "TIPO_CAMBIO": tipo_cambio,
+                        "ADUANA": aduana,
+                        "ID_FISCAL": "",
+                        "NOMBRE_DENOMINACION_O_RAZON_SOCIAL": "",
+                        "SEC": p.get('SEC',''),
+                        "FRACCION": p.get('FRACCION',''),
+                        "DESCRIPCION": p.get('DESCRIPCION',''),
+                        "TASA_IGI": p.get('TASA_IGI','')
+                    }
+                    resultados_local.append(fila)
+                df = pd.DataFrame(resultados_local)
+            else:
+                df = extraer_datos_completos(texto)
         for _, row in df.iterrows():
             fila = row.to_dict()
             fila["Archivo"] = os.path.basename(pdf_path)
@@ -596,6 +765,29 @@ def procesar_pedimentos_y_generar_csv(carpeta, archivo_salida_csv):
                                 df_final.at[idx, "NOMBRE_DENOMINACION_O_RAZON_SOCIAL"] = full_name
                 except Exception:
                     pass
+        # Post-procesamiento adicional: normalizar DESCRIPCION y extraer TASA_IGI si aparece incrustada
+        for idx, row in df_final.iterrows():
+            try:
+                desc = str(row.get('DESCRIPCION', '') or '')
+                tasa = str(row.get('TASA_IGI', '') or '')
+                # buscar IGI explícito en la descripcion
+                m_igi = re.search(r"\bIGI\s*([0-9]+\.[0-9]{5})\b", desc, re.IGNORECASE)
+                m_iva = re.search(r"\bIVA\s*([0-9]+\.[0-9]{5})\b", desc, re.IGNORECASE)
+                if m_igi:
+                    df_final.at[idx, 'TASA_IGI'] = m_igi.group(1)
+                    # eliminar el token IGI del texto
+                    newd = re.sub(r"\bIGI\s*[0-9]+\.[0-9]{5}\b", "", desc, flags=re.IGNORECASE).strip(' ,;')
+                    df_final.at[idx, 'DESCRIPCION'] = re.sub(r"\s{2,}", " ", newd).strip()
+                else:
+                    # si no hay IGI pero hay IVA en la descripcion, quitar IVA del texto
+                    if m_iva:
+                        newd = re.sub(r"\bIVA\s*[0-9]+\.[0-9]{5}\b", "", desc, flags=re.IGNORECASE).strip(' ,;')
+                        df_final.at[idx, 'DESCRIPCION'] = re.sub(r"\s{2,}", " ", newd).strip()
+                    # si aun no hay tasa y la columna tasa tiene valor, mantenerla
+                    if (not df_final.at[idx, 'TASA_IGI'] or str(df_final.at[idx, 'TASA_IGI']).strip() == '') and tasa:
+                        df_final.at[idx, 'TASA_IGI'] = tasa
+            except Exception:
+                pass
         df_final.to_csv(archivo_salida_csv, index=False, encoding="utf-8")
         print(f"Extracción completada. Archivo generado: {archivo_salida_csv}")
 
